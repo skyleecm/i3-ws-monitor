@@ -1,0 +1,300 @@
+#!/usr/bin/bash
+#  monitor time in i3 workspace, via replacing i3status
+#   save every saveMins
+#  i3status output interval = 5 (in ~/.config/i3status/config)
+#  gives warning if total time spent >= warnifMins mins
+#    ignores workspace 10 (ignoreWS) for time spent
+#  show workspace time at front of status line
+#
+#  if in gnome, this requires static workspaces
+#    gsettings set org.gnome.mutter dynamic-workspaces false
+#  and requires a custom https://github.com/skyleecm/argos extension to run it
+
+. i3-ws-monitor.config
+# i3status config
+statuscfg=~/.config/i3status/config
+if [ "$TERMUX" ]; then
+    statuscfg="${statuscfg}.android"
+fi
+#interval=5
+warnif=$((warnifMins*60))
+hour=$((saveMins*60))
+runfor=0
+runtotal=0
+date=$(date "+%Y%m%d")
+saveto="$savetoDir/$date"
+ignorews="\"$ignoreWS\""
+declare -A wstimes
+declare -A warnifWSSecs
+if ((${#warnifWSMins[@]} > 0)); then 
+    for ws in "${!warnifWSMins[@]}"; do
+        warnifWSSecs["$ws"]=$((warnifWSMins["$ws"]*60))
+    done
+fi
+wm=$(i3-msg -t get_version 2> /dev/null)
+inI3=0
+if [ "$wm" ]; then
+    inI3=1
+else
+    # assume gnome static workspaces setup with the same i3 names
+    # xdotool is 0 based
+    ignoreWS=$((ignoreWS-1))
+    wsnames=$(gsettings get org.gnome.desktop.wm.preferences workspace-names)
+    sh_IFS="$IFS"
+    IFS=',' read -r -a names <<<"${wsnames:1:-1}"
+    IFS="$sh_IFS"
+    for j in "${!names[@]}"; do
+        ws=${names[$j]}
+        ws=${ws%\'}
+        ws=${ws#*\'}
+        names[$j]=$ws
+    done
+fi
+
+readData() {
+    local total=0
+    while read -r key ; do
+        read -r val
+        wstimes["$key"]=$val
+        total=$((total+val))
+    done < <(jq -r 'to_entries|.[]|select(.key!="")|.key, .value' "$saveto")
+    runtotal=$total
+}
+
+save() {
+    {
+        echo "{" >&3
+        for ws in "${!wstimes[@]}"; do
+            echo "\"$ws\": ${wstimes[$ws]}," >&3
+        done
+        # json do not support trailing ,
+        echo '"":0' >&3
+        echo "}" >&3
+    } 3>$saveto
+}
+
+# show workspace time at front of status line
+#   in workspace ignoreWS, show total time
+wsStatus() {
+    local ws=$1
+    local line=$2
+    local aidx=$(expr index "$line" "[")
+    if (( $aidx == 0 )); then
+        echo "$line" || exit 1
+        return
+    fi
+    local time
+    local wsline
+    if [ "$ws" == "" ]; then
+        time=$runtotal
+    else
+        time=wstimes["$ws"]
+    fi
+    local sec=$((time % 60))
+    local min=$((time / 60))
+    local gt=">"
+    if (( $min >= 60 )); then
+        local hr=$((min / 60))
+        min=$((min % 60))
+        printf -v wsline "%d:%02d:%02d" $hr $min $sec
+    else
+        printf -v wsline "%02d:%02d" $min $sec
+    fi
+    # "color":"#FF0000"
+    local warn="" 
+    local tomax=$((warnif - runtotal));
+    local towsmax
+    if [ "$ws" != "" ] && [ ${warnifWSMins["$ws"]} ]; then 
+        towsmax=$((warnifWSSecs["$ws"] - time))
+    else  # workspace max is not set
+        towsmax=$((warnStatusInSecs + time))
+    fi
+    if (( $tomax <= $warnStatusInSecs )) || (( $towsmax <= $warnStatusInSecs )); then
+        if (($inI3 >= 1)); then 
+            warn="\"color\":\"$warnStatusCol\","
+        else
+            warn="color='$warnStatusCol'"
+        fi
+        # status is prefix with $ if total time is closer to its max
+        if (( $tomax < $towsmax )); then
+            gt="\$$gt"
+        fi
+    fi
+    if (($inI3 >= 1)); then 
+        # [ {"name":"wstime","full_text":"> ?:??:??"},
+        wsline="{\"name\":\"wstime\",$warn\"full_text\":\"$gt $wsline\"},"
+        echo "${line:0:$aidx}${wsline}${line:$aidx}" || exit 1
+    else
+        #echo "$wsline | dropdown=false $warn"
+        echo "$gt <span $warn>$wsline</span> | "
+    fi
+}
+
+PIDFILE="${XDG_RUNTIME_DIR:-$HOME}/i3-ws-monitor.pid"
+
+end() {
+    if [ "$TERMUX" ]; then
+        save
+        rm "$PIDFILE"
+        exit
+    fi
+    local state=$(systemctl is-system-running || /sbin/runlevel | cut -f 2 -d ' ')
+    len=$(expr length "$state")
+    if (($len == 1)); then
+        if (($state >= 2)) && (($state < 6)); then
+            save
+        fi
+    elif [ "$state" != "stopping" ]; then
+        save
+    fi
+    rm "$PIDFILE"
+    exit
+}
+
+# end running instance
+if [ -f "$PIDFILE" ]; then
+    read pid < $PIDFILE
+    name=$(ps -q $pid -o comm=)
+    if [ "$name" == "gs-ws-monitor.~" ]; then
+        pkill -P "$pid" 2> /dev/null
+        kill "$pid"
+    fi
+    rm "$PIDFILE"
+fi
+echo $$ > "$PIDFILE"
+
+# read saved data if it exist
+if [ -f "$saveto" ]; then
+    readData
+fi
+
+# need read to wait slightly longer
+#waitfor=$(expr $interval + 0.1)
+printf -v waitfor "%d.1" $interval 
+
+ 
+# if not in i3, use xdotool
+# return by $1
+get_ws() {
+    declare -n ws1=$1
+
+    local ws0=$(xdotool get_desktop 2> /dev/null)
+    if (( $ws0 == -1 )); then
+        ws0=0
+        xdotool set_desktop 0
+    fi
+    ws1=$((ws0+1))
+    if (( $ws0 == $ignoreWS )); then
+        ws1=$ignorews
+    else
+        ws1="$ws1: ${names[$ws0]}"
+    fi
+}
+
+update_ws() {
+    local ws=$1
+    local line=$2
+    local ignores=0   
+    if (( $# == 0 )); then
+        line="["
+        get_ws ws
+    fi
+    if [ "$ws" != "$ignorews" ]; then
+        ws=${ws%\"}
+        ws=${ws#\"}
+        ((wstimes["$ws"]+=interval))
+        runtotal=$((runtotal+interval))
+    
+        if (($runtotal >= $warnif)); then
+            if (($inI3 >= 1)); then 
+                i3-msg -q "workspace $ignoreWS"
+            else
+                xdotool set_desktop $ignoreWS
+            fi
+            notify-send -u critical -a "i3-ws-monitor" "Exceeded $warnifMins mins!" "Please stop!!"
+            ignores=1
+        elif [ ${warnifWSMins["$ws"]} ]; then 
+            if ((${wstimes["$ws"]} >= ${warnifWSSecs["$ws"]})); then
+                if (($inI3 >= 1)); then 
+                    i3-msg -q "workspace $ignoreWS"
+                else
+                    xdotool set_desktop $ignoreWS
+                fi
+                notify-send -u critical -a "i3-ws-monitor" "Exceeded workspace [$ws] ${warnifWSMins["$ws"]} mins!" "Please stop!!"
+                ignores=1
+            fi
+        fi
+    else
+        ignores=1
+    fi
+    if (( $ignores == 0 )); then
+        wsStatus "$ws" "$line"
+        runfor=$((runfor+interval))
+        tosave=$((runfor >= hour))
+    else  # show total
+        wsStatus "" "$line"
+        tosave=$((runfor > 0))
+    fi
+    if (($tosave == 1)); then
+        save
+        runfor=0
+    fi
+}
+
+if (($inI3 >= 1)); then
+ 
+i3status -c "$statuscfg" | (
+trap '' SIGTSTP
+trap end SIGTERM
+while read -t $waitfor line || (($? > 128)) ;
+do
+    if [ "$line" ] && [ "${line: -1}" != "]" ]; then
+        # adjust header to ignore stop signal with SIGTSTP
+        if [ "${line: -1}" == "}" ]; then
+            #echo "${line:0:-1}, \"stop_signal\": 10, \"cont_signal\": 12}" || exit 1
+            echo "${line:0:-1}, \"stop_signal\": 20, \"click_events\": true}" || exit 1
+        else
+            echo "$line" || exit 1
+        fi
+        continue
+    fi
+    ws=$(i3-msg -t get_workspaces | jq '.[] | select(.visible==true).name')
+    update_ws "$ws" "$line"
+done
+) &
+
+else
+trap end SIGTERM
+    while :  
+    do
+        update_ws 
+        sleep $interval
+    done
+fi
+
+# check mouse click to exit
+# set debugInt to value < debugIntMax to log
+debugInt=0
+debugIntMax=1800
+logto="$savetoDir/log_$date"
+if (($debugInt == 0)); then
+    debugInt=$debugIntMax
+    wait
+else
+while read -t $debugInt line || (($? > 128)) ;
+do
+    if [ "$line" ] && [ "${line: -1}" == "}" ]; then
+        if (($debugInt < $debugIntMax)); then
+            echo "$line" >> $logto
+        fi
+        if [ "${line:0:1}" == "," ]; then
+            line=${line:1}
+        fi
+        button=$(echo "$line" | jq 'select(.name=="wstime").button')
+        if (($button == 1)); then
+            i3-msg exit
+            break
+        fi
+    fi
+done
+fi
