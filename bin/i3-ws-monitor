@@ -31,6 +31,7 @@ if ((${#warnifWSMins[@]} > 0)); then
         warnifWSSecs["$ws"]=$((warnifWSMins["$ws"]*60))
     done
 fi
+warnMsgs=("Please stop!!" "Please shutdown in $warnStatusInSecs s, otherwise you will be logout !!")
 wm=$(i3-msg -t get_version 2> /dev/null)
 inI3=0
 if [ "$wm" ]; then
@@ -211,7 +212,7 @@ update_ws() {
             else
                 xdotool set_desktop $ignoreWS
             fi
-            notify-send -u critical -a "i3-ws-monitor" "Exceeded $warnifMins mins!" "Please stop!!"
+            notify-send -u critical -a "i3-ws-monitor" "Exceeded $warnifMins mins!" "${warnMsgs[$forceLogout]}"
             ignores=1
         elif [ ${warnifWSMins["$ws"]} ]; then 
             if ((${wstimes["$ws"]} >= ${warnifWSSecs["$ws"]})); then
@@ -220,12 +221,20 @@ update_ws() {
                 else
                     xdotool set_desktop $ignoreWS
                 fi
-                notify-send -u critical -a "i3-ws-monitor" "Exceeded workspace [$ws] ${warnifWSMins["$ws"]} mins!" "Please stop!!"
+                notify-send -u normal -a "i3-ws-monitor" "Exceeded workspace [$ws] ${warnifWSMins["$ws"]} mins!" "Please stop!!"
                 ignores=1
             fi
         fi
     else
         ignores=1
+        if (($runtotal >= $warnif)) && (($forceLogout > 0)); then
+            runtotal=$((runtotal+interval))
+            if (($runtotal >= warnif+warnStatusInSecs)); then 
+                runfor=0
+                # ? gnome needs session id to kill
+                loginctl kill-session "" || loginctl kill-session $( loginctl session-status | head -n 1 | cut -d ' ' -f 1 )
+            fi
+        fi
     fi
     if (( $ignores == 0 )); then
         wsStatus "$ws" "$line"
